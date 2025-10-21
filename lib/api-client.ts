@@ -1,5 +1,5 @@
 // API client for charge points backend
-const API_BASE_URL = "http://192.168.88.54:8081/api"
+const API_BASE_URL = "http://localhost:8081/api"
 
 export interface ApiConnector {
     id: number
@@ -27,7 +27,7 @@ export interface ApiResponse<T> {
 
 // Raw transaction shape from backend
 export interface ApiTransaction {
-    id: string
+    transactionId: number | string  // Изменено с id на transactionId
     chargePointId: string
     connectorId: number
     startTime: string
@@ -123,7 +123,7 @@ export class ApiClient {
 
     async getTransactions(): Promise<ApiTransaction[]> {
         try {
-            const response = await fetch(`${this.baseUrl}/transactions/recent`, {
+            const response = await fetch(`${this.baseUrl}/transactions/recent?limit=10`, {
                 method: "GET",
                 headers: { "Content-Type": "application/json" },
                 cache: "no-store",

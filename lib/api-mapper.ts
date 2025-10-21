@@ -54,7 +54,7 @@ export function mapApiStation(apiStation: ApiStation): ChargePoint {
 
 export function mapApiTransaction(t: ApiTransaction): Transaction {
     return {
-        id: t.id,
+        id: String(t.transactionId), // Используем transactionId и конвертируем в строку
         chargePointId: t.chargePointId,
         connectorId: t.connectorId,
         idTag: t.idTag || "UNKNOWN",

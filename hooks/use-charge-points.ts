@@ -87,15 +87,22 @@ export function useChargePoints() {
       const mapped = mapApiTransactions(apiTx)
       const unique = Array.from(new Map(mapped.map((tx) => [tx.id, tx])).values())
       setTransactions(unique)
+      console.log(`[fetchTransactions] Loaded ${unique.length} transactions`)
     } catch (e) {
       console.error("Failed to fetch transactions", e)
     }
-  }, [])
-
-  // Initial load for transactions
+  }, [])  // Initial load for transactions
   useEffect(() => {
     fetchTransactions()
-  }, [fetchTransactions])
+
+    // Автообновление каждые 5 секунд (оптимальная частота)
+    const interval = setInterval(() => {
+      fetchTransactions()
+      fetchStations()
+    }, 5000)
+
+    return () => clearInterval(interval)
+  }, [fetchTransactions, fetchStations])
   // Polling disabled by request
 
   // Polling disabled by request
@@ -306,17 +313,18 @@ export function useChargePoints() {
     )
   }
 
-  const startCharging = async (chargePointId: string, connectorId: number, idTag = "RFID-12345") => {
-    console.log(`[WS] RemoteStartTransaction for ${chargePointId} connector ${connectorId}`)
+  const startCharging = async (chargePointId: string, connectorId: number, idTag = "FRONTEND_USER") => {
+    console.log(`[startCharging] ${chargePointId} connector ${connectorId}`)
     try {
-      const response = await sendRemoteStartTransaction(
+      const response = await apiClient.remoteStartSession({
         chargePointId,
-        { connectorId, idTag }
-      )
-      console.log("[WS] RemoteStartTransaction response:", response)
+        connectorId,
+        idTag
+      })
+      console.log("[startCharging] Response:", response.success ? "Success" : "Failed")
 
-      if (response?.status === "Accepted" && response.transactionId) {
-        const transactionId = response.transactionId
+      if (response?.success) {
+        // Обновляем локальное состояние оптимистично
         setChargePoints(prev => prev.map(cp => {
           if (cp.id !== chargePointId) return cp
           return {
@@ -326,30 +334,67 @@ export function useChargePoints() {
               return {
                 ...conn,
                 status: "Occupied",
-                currentTransactionId: transactionId ?? conn.currentTransactionId,
                 lastUpdated: new Date().toISOString(),
               }
             })
           }
         }))
       }
+
+      // Обновляем данные через 2 секунды
+      setTimeout(() => {
+        fetchTransactions()
+        fetchStations()
+      }, 2000)
+
       return response
     } catch (error) {
-      console.error("RemoteStartTransaction failed", error)
+      console.error("[startCharging] Error:", error)
       throw error
     }
   }
 
   const stopCharging = async (chargePointId: string, transactionId: string) => {
-    console.log(`[WS] RemoteStopTransaction for ${chargePointId} transaction ${transactionId}`)
-    try {
-      const response = await sendRemoteStopTransaction(
-        chargePointId,
-        { transactionId }
-      )
-      console.log("[WS] RemoteStopTransaction response:", response)
+    console.log(`[stopCharging] Starting for ${chargePointId} transaction ${transactionId}`)
 
-      if (response?.status === "Accepted") {
+    // Находим connectorId по transactionId, как в рабочем фронтенде
+    let connectorId: number | null = null
+    console.log(`[stopCharging] Searching for connectorId in chargePoints:`, chargePoints)
+
+    for (const cp of chargePoints) {
+      if (cp.id === chargePointId) {
+        console.log(`[stopCharging] Found charge point:`, cp)
+        for (const conn of cp.connectors) {
+          console.log(`[stopCharging] Checking connector:`, conn)
+          if (conn.currentTransactionId === transactionId) {
+            connectorId = conn.connectorId
+            console.log(`[stopCharging] Found matching connector: ${connectorId}`)
+            break
+          }
+        }
+        break
+      }
+    }
+
+    if (connectorId === null) {
+      console.error('[stopCharging] ❌ No active transaction found for', transactionId)
+      console.error('[stopCharging] Available charge points:', chargePoints)
+      throw new Error('Нет активной транзакции для остановки')
+    }
+
+    try {
+      console.log(`[stopCharging] Calling API with connectorId: ${connectorId}`)
+      // Используем API клиент вместо WebSocket, как в рабочем фронтенде
+      const response = await apiClient.remoteStopSession({
+        chargePointId,
+        connectorId,
+        transactionId: typeof transactionId === 'string' ? parseInt(transactionId) : transactionId
+      })
+      console.log("[stopCharging] API response:", response)
+
+      if (response?.success) {
+        console.log("[stopCharging] Success! Updating local state...")
+        // Обновляем локальное состояние оптимистично
         setChargePoints(prev => prev.map(cp => {
           if (cp.id !== chargePointId) return cp
           return {
@@ -374,9 +419,18 @@ export function useChargePoints() {
           status: "Completed",
         } : tx))
       }
+
+      // Обновляем транзакции после 2 секунд, как в рабочем фронтенде
+      console.log("[stopCharging] Scheduling data refresh in 2 seconds...")
+      setTimeout(() => {
+        console.log("[stopCharging] Refreshing transactions and stations...")
+        fetchTransactions()
+        fetchStations() // Также обновляем станции
+      }, 2000)
+
       return response
     } catch (error) {
-      console.error("RemoteStopTransaction failed", error)
+      console.error("[stopCharging] Error:", error)
       throw error
     }
   }
