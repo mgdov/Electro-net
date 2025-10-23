@@ -87,3 +87,27 @@ export function getConnectorStatusLabel(status: ConnectorStatus): string {
   }
   return labels[status]
 }
+
+export function formatErrorCode(errorCode: string | null): string {
+  if (!errorCode) return ""
+  const errorMap: Record<string, string> = {
+    "UnknownError": "Неизвестная ошибка",
+    "ConnectorLockFailure": "Ошибка блокировки коннектора",
+    "EVCommunicationError": "Ошибка связи с электромобилем",
+    "GroundFailure": "Ошибка заземления",
+    "HighTemperature": "Перегрев",
+    "InternalError": "Внутренняя ошибка",
+    "LocalListConflict": "Конфликт локального списка",
+    "NoError": "Нет ошибки",
+    "OtherError": "Другая ошибка",
+    "OverCurrentFailure": "Перегрузка по току",
+    "OverVoltage": "Перегрузка по напряжению",
+    "PowerMeterFailure": "Ошибка счётчика мощности",
+    "PowerSwitchFailure": "Ошибка переключателя питания",
+    "ReaderFailure": "Ошибка считывателя",
+    "ResetFailure": "Ошибка сброса",
+    "UnderVoltage": "Низкое напряжение",
+    "WeakSignal": "Слабый сигнал",
+  }
+  return errorMap[errorCode] || errorCode
+}

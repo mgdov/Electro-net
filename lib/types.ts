@@ -12,6 +12,8 @@ export interface Connector {
   chargePointId: string
   status: ConnectorStatus
   currentTransactionId: string | null
+  // True когда сессия запущена, но ещё не получен окончательный transactionId от станции
+  awaitingTransactionId?: boolean
   powerLimit_kW: number
   currentPower_kW: number
   voltage_V: number
@@ -112,13 +114,13 @@ export interface MeterValue {
 
 export interface WebSocketEvent {
   event:
-    | "chargePoint.updated"
-    | "connector.statusChanged"
-    | "transaction.updated"
-    | "command.result"
-    | "meter.values"
-    | "transaction.started"
-    | "transaction.stopped"
+  | "chargePoint.updated"
+  | "connector.statusChanged"
+  | "transaction.updated"
+  | "command.result"
+  | "meter.values"
+  | "transaction.started"
+  | "transaction.stopped"
   data: any
   timestamp: string
 }

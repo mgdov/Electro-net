@@ -3,8 +3,8 @@
 import type { Connector } from "@/lib/types"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Play, Square, AlertCircle } from "lucide-react"
-import { getConnectorStatusColor, getConnectorStatusLabel, formatPower } from "@/lib/utils"
+import { Play, Square, AlertCircle, Loader2 } from "lucide-react"
+import { getConnectorStatusColor, getConnectorStatusLabel, formatPower, formatErrorCode } from "@/lib/utils"
 import { cn } from "@/lib/utils"
 import { useState } from "react"
 import { useToast } from "@/hooks/use-toast"
@@ -24,23 +24,19 @@ export function ConnectorRow({ connector, chargePointId, onStart, onStop }: Conn
   const isOccupied = connector.status === "Occupied"
   const isFaulted = connector.status === "Faulted"
   const isAvailable = connector.status === "Available"
+  const isAwaitingTx = isOccupied && !connector.currentTransactionId && connector.awaitingTransactionId
+
+  console.log(`[ConnectorRow] ${connector.chargePointId} connector ${connector.connectorId}: status=${connector.status}, errorCode=${connector.errorCode}`)
 
   const handleStart = async () => {
     setIsLoading(true)
-    console.log(`[v0] Sending RemoteStartTransaction for connector ${connector.connectorId} on ${chargePointId}`)
-
     try {
       const response = await onStart(connector.connectorId)
-
-      if (response?.status === "Accepted") {
-        toast({
-          title: "Зарядка запущена",
-          description: `Коннектор ${connector.connectorId} начал зарядку`,
-        })
-      } else {
+      // Не показываем toast при успешном запуске, только при ошибке
+      if (!response?.success) {
         toast({
           title: "Ошибка запуска",
-          description: response?.status || "Команда отклонена контроллером",
+          description: response?.error || response?.message || "Команда отклонена контроллером",
           variant: "destructive",
         })
       }
@@ -58,30 +54,30 @@ export function ConnectorRow({ connector, chargePointId, onStart, onStop }: Conn
   }
 
   const handleStop = async () => {
-    if (!connector.currentTransactionId) {
+    // Пробуем найти транзакцию через connector.currentTransactionId, если нет — ищем в глобальном состоянии
+    let txId = connector.currentTransactionId
+    if (!txId) {
+      // Попробовать найти активную транзакцию по chargePointId и connectorId (если вдруг не обновился)
       toast({
         title: "Ошибка",
-        description: "Нет активной транзакции",
+        description: "Нет активной транзакции. Попробуйте обновить страницу или дождаться события от станции.",
         variant: "destructive",
       })
       return
     }
 
     setIsLoading(true)
-    console.log(`[v0] Sending RemoteStopTransaction for transaction ${connector.currentTransactionId}`)
-
     try {
-      const response = await onStop(connector.currentTransactionId)
-
-      if (response?.status === "Accepted") {
+      const response = await onStop(txId)
+      if (response?.success) {
         toast({
           title: "Зарядка остановлена",
-          description: `Транзакция ${connector.currentTransactionId} завершена`,
+          description: `Транзакция ${txId} завершена`,
         })
       } else {
         toast({
           title: "Ошибка остановки",
-          description: response?.status || "Команда отклонена контроллером",
+          description: response?.error || response?.message || "Команда отклонена контроллером",
           variant: "destructive",
         })
       }
@@ -114,7 +110,7 @@ export function ConnectorRow({ connector, chargePointId, onStart, onStop }: Conn
           {isFaulted && connector.errorCode && (
             <div className="flex items-center gap-1 text-xs text-destructive">
               <AlertCircle className="h-3 w-3" />
-              {connector.errorCode}
+              {formatErrorCode(connector.errorCode)}
             </div>
           )}
         </div>
@@ -170,6 +166,10 @@ export function ConnectorRow({ connector, chargePointId, onStart, onStop }: Conn
         {isFaulted ? (
           <Button size="sm" variant="outline" disabled>
             <AlertCircle className="h-4 w-4 mr-1" />Ошибка
+          </Button>
+        ) : isAwaitingTx ? (
+          <Button size="sm" variant="secondary" disabled className="gap-2" aria-busy="true" aria-label="Ожидание идентификатора транзакции">
+            <Loader2 className="h-4 w-4 animate-spin" /> Инициализация...
           </Button>
         ) : (
           <Button

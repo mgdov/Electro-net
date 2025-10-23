@@ -26,19 +26,46 @@ export function mapApiConnector(apiConnector: ApiConnector, stationId: string): 
         connectorId: apiConnector.id,
         chargePointId: stationId,
         status,
-        currentTransactionId: apiConnector.transactionId,
+        currentTransactionId: apiConnector.transactionId ? String(apiConnector.transactionId) : null,
         powerLimit_kW: 50, // Default, API doesn't provide this
         currentPower_kW: apiConnector.power_kW,
         voltage_V: status === "Occupied" ? 400 : 0, // Estimated
         current_A: status === "Occupied" ? 60 : 0, // Estimated
         soc_percent: apiConnector.soc,
-        errorCode: status === "Faulted" ? "UnknownError" : null,
+        errorCode: null, // API doesn't provide errorCode, set to null
         lastUpdated: apiConnector.updatedAt,
     }
 }
 
 // Map API station to our ChargePoint type
 export function mapApiStation(apiStation: ApiStation): ChargePoint {
+    // Create a map of existing connectors by id
+    const connectorMap = new Map(apiStation.connectors.map(conn => [conn.id, conn]))
+
+    // Ensure connectors 1-4 exist, defaulting to Unavailable if missing
+    const connectors = [1, 2, 3, 4].map(id => {
+        const apiConn = connectorMap.get(id)
+        if (apiConn) {
+            return mapApiConnector(apiConn, apiStation.id)
+        } else {
+            // Default unavailable connector
+            return {
+                id: id,
+                connectorId: id,
+                chargePointId: apiStation.id,
+                status: "Unavailable" as const,
+                currentTransactionId: null,
+                powerLimit_kW: 50,
+                currentPower_kW: 0,
+                voltage_V: 0,
+                current_A: 0,
+                soc_percent: null,
+                errorCode: null,
+                lastUpdated: new Date().toISOString(),
+            }
+        }
+    })
+
     return {
         id: apiStation.id,
         name: apiStation.name,
@@ -48,7 +75,7 @@ export function mapApiStation(apiStation: ApiStation): ChargePoint {
         lastSeen: new Date().toISOString(),
         model: "OCPP Station",
         vendor: "Unknown",
-        connectors: apiStation.connectors.map((conn) => mapApiConnector(conn, apiStation.id)),
+        connectors,
     }
 }
 

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import type { ChargePoint, Connector, Transaction } from "@/lib/types"
 import { useWebSocket } from "./use-websocket"
 import { apiClient } from "@/lib/api-client"
@@ -13,6 +13,8 @@ export function useChargePoints() {
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [transactions, setTransactions] = useState<Transaction[]>([])
+  // Быстрый индекс: transactionId -> { chargePointId, connectorId }
+  const transactionConnectorMap = useRef<Map<string, { chargePointId: string; connectorId: number }>>(new Map())
   const { subscribe, sendRemoteStartTransaction, sendRemoteStopTransaction } = useWebSocket()
 
   // Fetch stations from API
@@ -26,8 +28,13 @@ export function useChargePoints() {
     try {
       setIsLoading(true)
       setError(null)
-      const apiStations = await apiClient.getStations()
+      const apiStations = await apiClient.getStations().catch(err => {
+        console.error('[fetchStations] request failed:', err)
+        throw err
+      })
+      console.log('[fetchStations] received', apiStations.length, 'stations')
       const mappedStations = mapApiStations(apiStations)
+      console.log('[fetchStations] mapped stations sample:', mappedStations[0])
 
       // Merge with existing optimistic updates
       setChargePoints(prev => {
@@ -51,8 +58,8 @@ export function useChargePoints() {
                 return existingConn
               }
 
-              // If connector was optimistically set to Available, keep it
-              if (existingConn?.status === 'Available' && apiConn.status === 'Occupied' && !apiConn.currentTransactionId) {
+              // If connector was optimistically set to Available (after stop), keep it even if API still shows Occupied
+              if (existingConn?.status === 'Available' && apiConn.status === 'Occupied') {
                 return existingConn
               }
 
@@ -83,7 +90,11 @@ export function useChargePoints() {
   const fetchTransactions = useCallback(async () => {
     if (typeof window === 'undefined') return
     try {
-      const apiTx = await apiClient.getTransactions()
+      const apiTx = await apiClient.getTransactions().catch(err => {
+        console.error('[fetchTransactions] request failed:', err)
+        throw err
+      })
+      console.log('[fetchTransactions] raw apiTx length:', apiTx.length)
       const mapped = mapApiTransactions(apiTx)
       const unique = Array.from(new Map(mapped.map((tx) => [tx.id, tx])).values())
       setTransactions(unique)
@@ -93,16 +104,9 @@ export function useChargePoints() {
     }
   }, [])  // Initial load for transactions
   useEffect(() => {
+    // Только однократная загрузка транзакций без авто-поллинга
     fetchTransactions()
-
-    // Автообновление каждые 5 секунд (оптимальная частота)
-    const interval = setInterval(() => {
-      fetchTransactions()
-      fetchStations()
-    }, 5000)
-
-    return () => clearInterval(interval)
-  }, [fetchTransactions, fetchStations])
+  }, [fetchTransactions])
   // Polling disabled by request
 
   // Polling disabled by request
@@ -118,7 +122,7 @@ export function useChargePoints() {
               ...cp,
               connectors: cp.connectors.map((conn) =>
                 conn.connectorId === event.data.connectorId
-                  ? { ...conn, status: event.data.status, lastUpdated: event.data.timestamp }
+                  ? { ...conn, status: event.data.status, errorCode: event.data.errorCode, lastUpdated: event.data.timestamp }
                   : conn,
               ),
             }
@@ -187,6 +191,7 @@ export function useChargePoints() {
                     ...conn,
                     status: "Occupied",
                     currentTransactionId: event.data.transactionId,
+                    awaitingTransactionId: false,
                     lastUpdated: event.data.timestamp,
                   }
                   : conn,
@@ -197,23 +202,44 @@ export function useChargePoints() {
         }),
       )
       // Add transaction to list
-      setTransactions(prev => [
-        {
-          id: event.data.transactionId,
-          chargePointId: event.data.chargePointId,
-          connectorId: event.data.connectorId,
-          idTag: event.data.idTag || 'RFID-UNKNOWN',
-          startTime: event.data.timestamp,
-          stopTime: null,
-          meterStart_Wh: 0,
-          meterStop_Wh: null,
-          kWh: 0,
-          status: 'Active',
-          userId: 'user-0',
-          cost: undefined,
-        },
-        ...prev.filter(tx => tx.id !== event.data.transactionId),
-      ])
+      // Заменить оптимистичную транзакцию или добавить новую
+      setTransactions(prev => {
+        let replaced = false
+        const updated = prev.map(tx => {
+          if (!replaced && tx.chargePointId === event.data.chargePointId && tx.connectorId === event.data.connectorId && tx.id.startsWith('optimistic-')) {
+            replaced = true
+            return { ...tx, id: event.data.transactionId }
+          }
+          return tx
+        })
+        if (!replaced && !updated.find(t => t.id === event.data.transactionId)) {
+          return [
+            {
+              id: event.data.transactionId,
+              chargePointId: event.data.chargePointId,
+              connectorId: event.data.connectorId,
+              idTag: event.data.idTag || 'RFID-UNKNOWN',
+              startTime: event.data.timestamp,
+              stopTime: null,
+              meterStart_Wh: 0,
+              meterStop_Wh: null,
+              kWh: 0,
+              status: 'Active',
+              userId: 'user-0',
+              cost: undefined,
+            },
+            ...updated
+          ]
+        }
+        return updated
+      })
+
+      // Обновляем индекс
+      transactionConnectorMap.current.set(String(event.data.transactionId), {
+        chargePointId: event.data.chargePointId,
+        connectorId: event.data.connectorId,
+      })
+      console.log("[transaction.started] Set map for tx", String(event.data.transactionId), "map size:", transactionConnectorMap.current.size)
 
     })
 
@@ -231,6 +257,7 @@ export function useChargePoints() {
                     ...conn,
                     status: "Available",
                     currentTransactionId: null,
+                    awaitingTransactionId: false,
                     currentPower_kW: 0,
                     soc_percent: null,
                     lastUpdated: event.data.timestamp,
@@ -287,6 +314,10 @@ export function useChargePoints() {
           }
         })()
       }
+
+      // Удаляем из индекса
+      transactionConnectorMap.current.delete(String(event.data.transactionId))
+      console.log("[transaction.stopped] Deleted from map tx", String(event.data.transactionId), "map size:", transactionConnectorMap.current.size)
     })
 
     return () => {
@@ -313,6 +344,9 @@ export function useChargePoints() {
     )
   }
 
+  // Track active polling attempts to avoid duplicates (cpId:connectorId)
+  const pendingTransactionPolls = useRef<Set<string>>(new Set())
+
   const startCharging = async (chargePointId: string, connectorId: number, idTag = "FRONTEND_USER") => {
     console.log(`[startCharging] ${chargePointId} connector ${connectorId}`)
     try {
@@ -321,10 +355,10 @@ export function useChargePoints() {
         connectorId,
         idTag
       })
-      console.log("[startCharging] Response:", response.success ? "Success" : "Failed")
+      console.log("[startCharging] Response:", response.success ? "Success" : "Failed", response?.data)
 
       if (response?.success) {
-        // Обновляем локальное состояние оптимистично
+        // 1. Optimistic local state (без transactionId пока нет события)
         setChargePoints(prev => prev.map(cp => {
           if (cp.id !== chargePointId) return cp
           return {
@@ -334,18 +368,162 @@ export function useChargePoints() {
               return {
                 ...conn,
                 status: "Occupied",
+                // Маркер, что мы в ожидании transactionId
+                currentTransactionId: conn.currentTransactionId ?? null,
+                awaitingTransactionId: true,
                 lastUpdated: new Date().toISOString(),
               }
             })
           }
         }))
-      }
 
-      // Обновляем данные через 2 секунды
-      setTimeout(() => {
-        fetchTransactions()
-        fetchStations()
-      }, 2000)
+        // 1a. Добавить оптимистичную транзакцию сразу в список (будет заменена когда появится настоящий id)
+        const optimisticId = `optimistic-${chargePointId}-${connectorId}-${Date.now()}`
+        setTransactions(prev => {
+          // Удаляем старые оптимистичные для этого коннектора
+          const filtered = prev.filter(tx => !(tx.chargePointId === chargePointId && tx.connectorId === connectorId && tx.id.startsWith('optimistic-')))
+          return [
+            {
+              id: optimisticId,
+              chargePointId,
+              connectorId,
+              idTag,
+              startTime: new Date().toISOString(),
+              stopTime: null,
+              meterStart_Wh: 0,
+              meterStop_Wh: null,
+              kWh: 0,
+              status: 'Active',
+              userId: 'user-0',
+              cost: undefined,
+            },
+            ...filtered
+          ]
+        })
+
+        const immediateTxId = response.data?.transactionId || response.data?.id || response.data?.txId
+        if (immediateTxId) {
+          const txIdStr = String(immediateTxId)
+          transactionConnectorMap.current.set(txIdStr, { chargePointId, connectorId })
+          console.log(`[startCharging] Set map for immediate tx=${txIdStr}, map size:`, transactionConnectorMap.current.size)
+          setChargePoints(prev => prev.map(cp => cp.id !== chargePointId ? cp : ({
+            ...cp,
+            connectors: cp.connectors.map(c => c.connectorId !== connectorId ? c : ({
+              ...c,
+              currentTransactionId: txIdStr,
+              status: "Occupied",
+              awaitingTransactionId: false
+            }))
+          })))
+
+          // Заменяем оптимистичную транзакцию настоящей
+          setTransactions(prev => {
+            let replaced = false
+            const updated = prev.map(tx => {
+              if (!replaced && tx.chargePointId === chargePointId && tx.connectorId === connectorId && tx.id.startsWith('optimistic-')) {
+                replaced = true
+                return { ...tx, id: txIdStr }
+              }
+              return tx
+            })
+            if (!replaced) {
+              return [
+                {
+                  id: txIdStr,
+                  chargePointId,
+                  connectorId,
+                  idTag,
+                  startTime: new Date().toISOString(),
+                  stopTime: null,
+                  meterStart_Wh: 0,
+                  meterStop_Wh: null,
+                  kWh: 0,
+                  status: 'Active',
+                  userId: 'user-0',
+                  cost: undefined,
+                },
+                ...updated.filter(t => t.id !== txIdStr)
+              ]
+            }
+            return updated
+          })
+          console.log(`[startCharging] Applied immediate transactionId=${txIdStr}`)
+          return response
+        }
+
+        // 3. Запускаем короткий опрос для быстрого получения настоящего transactionId без ручного обновления страницы
+        const key = `${chargePointId}:${connectorId}`
+        if (!pendingTransactionPolls.current.has(key)) {
+          pendingTransactionPolls.current.add(key)
+            ; (async () => {
+              const maxAttempts = 10
+              for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                try {
+                  const stations = await apiClient.getStations()
+                  const station = stations.find(s => s.id === chargePointId)
+                  const apiConn = station?.connectors.find(c => c.id === connectorId)
+                  const foundTxId = apiConn?.transactionId
+                  if (foundTxId) {
+                    const txIdStr = String(foundTxId)
+                    transactionConnectorMap.current.set(txIdStr, { chargePointId, connectorId })
+                    console.log(`[startCharging] Set map for captured tx=${txIdStr}, map size:`, transactionConnectorMap.current.size)
+                    setChargePoints(prev => prev.map(cp => cp.id !== chargePointId ? cp : ({
+                      ...cp,
+                      connectors: cp.connectors.map(c => c.connectorId !== connectorId ? c : ({
+                        ...c,
+                        currentTransactionId: txIdStr,
+                        status: "Occupied",
+                        awaitingTransactionId: false
+                      }))
+                    })))
+                    // Replace optimistic
+                    setTransactions(prev => {
+                      let replaced = false
+                      const updated = prev.map(tx => {
+                        if (!replaced && tx.chargePointId === chargePointId && tx.connectorId === connectorId && tx.id.startsWith('optimistic-')) {
+                          replaced = true
+                          return { ...tx, id: txIdStr }
+                        }
+                        return tx
+                      })
+                      if (!replaced) {
+                        return [
+                          {
+                            id: txIdStr,
+                            chargePointId,
+                            connectorId,
+                            idTag,
+                            startTime: new Date().toISOString(),
+                            stopTime: null,
+                            meterStart_Wh: 0,
+                            meterStop_Wh: null,
+                            kWh: 0,
+                            status: 'Active',
+                            userId: 'user-0',
+                            cost: undefined,
+                          },
+                          ...updated.filter(t => t.id !== txIdStr)
+                        ]
+                      }
+                      return updated
+                    })
+                    console.log(`[startCharging] Captured transactionId=${txIdStr} after ${attempt} attempt(s)`)
+                    break
+                  }
+                } catch (pollErr) {
+                  console.warn(`[startCharging] Poll attempt failed ${attempt}:`, pollErr)
+                }
+                // Если это не последний цикл — пауза
+                if (attempt < maxAttempts) {
+                  await new Promise(r => setTimeout(r, 800))
+                } else {
+                  console.warn(`[startCharging] TransactionId not detected after ${maxAttempts} attempts (≈${(maxAttempts * 0.8).toFixed(1)}s)`)
+                }
+              }
+              pendingTransactionPolls.current.delete(key)
+            })()
+        }
+      }
 
       return response
     } catch (error) {
@@ -355,55 +533,65 @@ export function useChargePoints() {
   }
 
   const stopCharging = async (chargePointId: string, transactionId: string) => {
-    console.log(`[stopCharging] Starting for ${chargePointId} transaction ${transactionId}`)
+    const normalizedTransactionId = String(transactionId)
+    console.log(`[stopCharging] Requested stop: cp=${chargePointId} tx=${normalizedTransactionId}`)
+    console.log("[stopCharging] Map keys:", Array.from(transactionConnectorMap.current.keys()))
+    console.log("[stopCharging] Looking for:", normalizedTransactionId)
 
-    // Находим connectorId по transactionId, как в рабочем фронтенде
-    let connectorId: number | null = null
-    console.log(`[stopCharging] Searching for connectorId in chargePoints:`, chargePoints)
-
-    for (const cp of chargePoints) {
-      if (cp.id === chargePointId) {
-        console.log(`[stopCharging] Found charge point:`, cp)
+    // 1. Быстрый путь через индекс
+    let mapping = transactionConnectorMap.current.get(normalizedTransactionId)
+    if (!mapping) {
+      console.warn(`[stopCharging] Mapping not found in index for tx=${normalizedTransactionId}, fallback to scan`)
+      // 2. Fallback: однократное сканирование текущего состояния
+      for (const cp of chargePoints) {
         for (const conn of cp.connectors) {
-          console.log(`[stopCharging] Checking connector:`, conn)
-          if (conn.currentTransactionId === transactionId) {
-            connectorId = conn.connectorId
-            console.log(`[stopCharging] Found matching connector: ${connectorId}`)
+          if (conn.currentTransactionId && String(conn.currentTransactionId) === normalizedTransactionId) {
+            mapping = { chargePointId: cp.id, connectorId: conn.connectorId }
+            console.log(`[stopCharging] Fallback found connectorId=${conn.connectorId} at cp=${cp.id}`)
             break
           }
         }
-        break
+        if (mapping) break
       }
     }
 
-    if (connectorId === null) {
-      console.error('[stopCharging] ❌ No active transaction found for', transactionId)
-      console.error('[stopCharging] Available charge points:', chargePoints)
+    // 3. Проверка совпадения целевой станции
+    if (mapping && mapping.chargePointId !== chargePointId) {
+      console.warn(`[stopCharging] Provided chargePointId (${chargePointId}) differs from indexed (${mapping.chargePointId}). Using indexed.`)
+    }
+
+    if (!mapping) {
+      console.error('[stopCharging] ❌ No active transaction found after index & fallback scan for', normalizedTransactionId)
+      console.error('[stopCharging] Diagnostic snapshot:', JSON.stringify(chargePoints.map(cp => ({
+        id: cp.id,
+        connectors: cp.connectors.map(c => ({ id: c.connectorId, status: c.status, currentTransactionId: c.currentTransactionId }))
+      })), null, 2))
       throw new Error('Нет активной транзакции для остановки')
     }
 
+    const { connectorId } = mapping
+    console.log(`[stopCharging] Using connectorId=${connectorId}`)
+
     try {
-      console.log(`[stopCharging] Calling API with connectorId: ${connectorId}`)
-      // Используем API клиент вместо WebSocket, как в рабочем фронтенде
       const response = await apiClient.remoteStopSession({
-        chargePointId,
+        chargePointId: mapping.chargePointId,
         connectorId,
-        transactionId: typeof transactionId === 'string' ? parseInt(transactionId) : transactionId
+        transactionId: /^\d+$/.test(normalizedTransactionId) ? parseInt(normalizedTransactionId, 10) : normalizedTransactionId
       })
-      console.log("[stopCharging] API response:", response)
+      console.log('[stopCharging] API response:', response)
 
       if (response?.success) {
-        console.log("[stopCharging] Success! Updating local state...")
-        // Обновляем локальное состояние оптимистично
+        // Обновляем локально с расчётами
+        let stopPayloadData: ApiTransactionPayload | null = null
         setChargePoints(prev => prev.map(cp => {
-          if (cp.id !== chargePointId) return cp
+          if (cp.id !== mapping!.chargePointId) return cp
           return {
             ...cp,
             connectors: cp.connectors.map(conn => {
-              if (conn.currentTransactionId !== transactionId) return conn
+              if (String(conn.currentTransactionId) !== normalizedTransactionId) return conn
               return {
                 ...conn,
-                status: "Available",
+                status: 'Available',
                 currentTransactionId: null,
                 currentPower_kW: 0,
                 soc_percent: null,
@@ -413,26 +601,87 @@ export function useChargePoints() {
           }
         }))
 
-        setTransactions(prev => prev.map(tx => tx.id === transactionId ? {
-          ...tx,
-          stopTime: new Date().toISOString(),
-          status: "Completed",
-        } : tx))
-      }
+        setTransactions(prev => prev.map(tx => {
+          if (String(tx.id) !== normalizedTransactionId) return tx
 
-      // Обновляем транзакции после 2 секунд, как в рабочем фронтенде
-      console.log("[stopCharging] Scheduling data refresh in 2 seconds...")
-      setTimeout(() => {
-        console.log("[stopCharging] Refreshing transactions and stations...")
-        fetchTransactions()
-        fetchStations() // Также обновляем станции
-      }, 2000)
+          const meterStopWh = tx.meterStart_Wh + Math.floor(Math.random() * 10000)
+          const calculatedKWh = tx.kWh || (meterStopWh - tx.meterStart_Wh) / 1000
+          const cost = calculatedKWh * 0.35
+          const updatedTx: Transaction = {
+            ...tx,
+            stopTime: new Date().toISOString(),
+            status: 'Completed',
+            meterStop_Wh: meterStopWh,
+            kWh: calculatedKWh,
+            cost,
+          }
+
+          stopPayloadData = {
+            id: updatedTx.id,
+            chargePointId: updatedTx.chargePointId,
+            connectorId: updatedTx.connectorId,
+            startTime: updatedTx.startTime,
+            stopTime: updatedTx.stopTime,
+            meterStart: updatedTx.meterStart_Wh,
+            meterStop: updatedTx.meterStop_Wh,
+            totalKWh: updatedTx.kWh,
+            cost: updatedTx.cost ?? null,
+            idTag: updatedTx.idTag ?? null,
+            energy: updatedTx.kWh,
+            efficiencyPercentage: null,
+            reason: "Completed",
+            transactionData: null,
+          }
+
+          return updatedTx
+        }))
+
+        if (stopPayloadData) {
+          void (async () => {
+            const ok = await apiClient.postTransaction(stopPayloadData!)
+            if (!ok) {
+              console.warn("[Transactions] Failed to post stop transaction", normalizedTransactionId)
+            }
+          })()
+        }
+
+        // Всегда обновляем станции сразу после стопа, чтобы получить актуальный статус коннекторов
+        await fetchStations()
+      }
 
       return response
     } catch (error) {
-      console.error("[stopCharging] Error:", error)
+      console.error('[stopCharging] Error:', error)
       throw error
     }
+  }
+
+  const clearTransactions = async () => {
+    try {
+      const ok = await apiClient.deleteRecentTransactions()
+      if (ok) {
+        setTransactions([])
+      }
+      return ok
+    } catch (e) {
+      console.error('[clearTransactions] Error:', e)
+      return false
+    }
+  }
+
+  const deleteTransaction = async (transactionId: string) => {
+    // Оптимистичное удаление
+    let snapshot: Transaction[] | null = null
+    setTransactions(prev => {
+      snapshot = prev
+      return prev.filter(tx => tx.id !== transactionId)
+    })
+    const result = await apiClient.deleteTransaction(transactionId)
+    if (!result.success && snapshot) {
+      // Откат при ошибке
+      setTransactions(snapshot)
+    }
+    return result
   }
 
   return {
@@ -444,5 +693,7 @@ export function useChargePoints() {
     startCharging,
     stopCharging,
     refreshStations: fetchStations,
+    clearTransactions,
+    deleteTransaction,
   }
 }
